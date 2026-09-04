@@ -21,6 +21,8 @@ const CHECKOUT_FORMAT = 1
 const ARCHIVE_PATHS = ['src/main', 'src/shared', 'src/preload', 'src/renderer', 'src/types']
 
 const BASELINE_REF_ENV = 'ORCA_CROSS_VERSION_BASELINE_REF'
+const UPSTREAM_RELEASE_REMOTE_ENV = 'ORCA_CROSS_VERSION_UPSTREAM_REMOTE'
+const DEFAULT_UPSTREAM_RELEASE_REMOTE = 'https://github.com/stablyai/orca.git'
 const STABLE_DESKTOP_RELEASE_TAG = /^v\d+\.\d+\.\d+$/
 
 export type ReleaseCheckout = {
@@ -60,9 +62,85 @@ function compareReleaseTags(a: string, b: string): number {
   return 0
 }
 
+export function selectLatestStableReleaseTag(tags: string[]): string | null {
+  return (
+    tags
+      .filter((tag) => STABLE_DESKTOP_RELEASE_TAG.test(tag))
+      .sort(compareReleaseTags)
+      .at(-1) ?? null
+  )
+}
+
+export function selectLatestStableReleaseTagBeforeCurrent(
+  tags: string[],
+  currentVersion: string
+): string | null {
+  const [core, prerelease] = currentVersion.split('-', 2)
+  const currentTag = `v${core}`
+  if (!STABLE_DESKTOP_RELEASE_TAG.test(currentTag)) {
+    throw new Error(`Current package version "${currentVersion}" is not a supported semver release.`)
+  }
+  return (
+    tags
+      .filter((tag) => STABLE_DESKTOP_RELEASE_TAG.test(tag))
+      .filter((tag) => {
+        const comparison = compareReleaseTags(tag, currentTag)
+        return prerelease ? comparison < 0 : comparison <= 0
+      })
+      .sort(compareReleaseTags)
+      .at(-1) ?? null
+  )
+}
+
+function readCurrentPackageVersion(): string {
+  const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as {
+    version?: unknown
+  }
+  if (typeof packageJson.version !== 'string' || packageJson.version.length === 0) {
+    throw new Error('Cross-version harness could not read the current package version.')
+  }
+  return packageJson.version
+}
+
+function fetchLatestUpstreamStableReleaseTag(): string | null {
+  const remote = process.env[UPSTREAM_RELEASE_REMOTE_ENV]?.trim() || DEFAULT_UPSTREAM_RELEASE_REMOTE
+  let refs: string
+  try {
+    refs = git(['ls-remote', '--tags', '--refs', remote, 'refs/tags/v*'])
+  } catch (error) {
+    throw new Error(
+      `Cross-version harness found no local stable release tag and could not query ${remote}: ${String(error)}. ` +
+        `Pin a known release with ${BASELINE_REF_ENV} or configure ${UPSTREAM_RELEASE_REMOTE_ENV}.`
+    )
+  }
+
+  const tags = refs
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/)[1] ?? '')
+    .map((ref) => ref.replace(/^refs\/tags\//, ''))
+    .filter(Boolean)
+  const currentVersion = readCurrentPackageVersion()
+  const latest = selectLatestStableReleaseTagBeforeCurrent(tags, currentVersion)
+  if (!latest) {
+    return null
+  }
+
+  try {
+    git(['fetch', '--no-tags', remote, `refs/tags/${latest}:refs/tags/${latest}`])
+  } catch (error) {
+    throw new Error(
+      `Cross-version harness discovered upstream release ${latest} but could not fetch it from ${remote}: ${String(error)}. ` +
+        `Pin an available release with ${BASELINE_REF_ENV}.`
+    )
+  }
+  return latest
+}
+
 /**
  * The version point the harness pairs current code against. An explicit
  * {@link BASELINE_REF_ENV} wins; otherwise the newest stable desktop release tag.
+ * Forks without copied release tags fall back to the official Orca release remote,
+ * capped so a prerelease never tests against a newer stable upstream build.
  *
  * Throws rather than skipping: a cross-version lane that quietly runs nothing is
  * the exact failure this harness exists to prevent.
@@ -82,22 +160,18 @@ export function resolveBaselineReleaseRef(): string {
     )
   }
   const latest = selectLatestStableReleaseTag(tags)
-  if (!latest) {
-    throw new Error(
-      `Cross-version harness found no stable desktop release tags matching vX.Y.Z (saw ${tags.length} tag(s) total). ` +
-        'CI checkouts default to a shallow clone with no tags: use `actions/checkout` with `fetch-depth: 0`, ' +
-        `or pin a ref with ${BASELINE_REF_ENV}.`
-    )
+  if (latest) {
+    return latest
   }
-  return latest
-}
 
-export function selectLatestStableReleaseTag(tags: string[]): string | null {
-  return (
-    tags
-      .filter((tag) => STABLE_DESKTOP_RELEASE_TAG.test(tag))
-      .sort(compareReleaseTags)
-      .at(-1) ?? null
+  const upstreamLatest = fetchLatestUpstreamStableReleaseTag()
+  if (upstreamLatest) {
+    return upstreamLatest
+  }
+
+  throw new Error(
+    `Cross-version harness found no stable desktop release older than or equal to the current build locally or on the configured upstream remote. ` +
+      `Pin a known release with ${BASELINE_REF_ENV}.`
   )
 }
 

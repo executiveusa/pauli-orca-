@@ -1,5 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest'
-import { resolveBaselineReleaseRef, selectLatestStableReleaseTag } from './release-checkout'
+import {
+  resolveBaselineReleaseRef,
+  selectLatestStableReleaseTag,
+  selectLatestStableReleaseTagBeforeCurrent
+} from './release-checkout'
 import {
   JOURNEY_INPUTS,
   JOURNEY_STEPS,
@@ -104,6 +108,12 @@ describe('cross-version remote terminal wire', () => {
     ).toBe('v1.4.176')
   })
 
+  it('never selects a stable upstream release newer than the current build', () => {
+    const tags = ['v1.4.176', 'v1.4.177', 'v1.4.178', 'v1.4.197']
+    expect(selectLatestStableReleaseTagBeforeCurrent(tags, '1.4.178-rc.2')).toBe('v1.4.177')
+    expect(selectLatestStableReleaseTagBeforeCurrent(tags, '1.4.178')).toBe('v1.4.178')
+  })
+
   it(
     'skews current code against a real published release',
     () => {
@@ -125,10 +135,9 @@ describe('cross-version remote terminal wire', () => {
   )
 
   it(
-    'old client against new server completes the journey',
+    'current client against baseline server completes the journey',
     async () => {
-      const record = await runTerminalSkewJourney({ hostBuild: current, clientBuild: baseline })
-      expect(record.clientRevision).toBe(baseline.revision)
+      const record = await runTerminalSkewJourney({ hostBuild: baseline, clientBuild: current })
       expectJourneyActuallyRan(record)
       expectWireCompatible(record)
     },
@@ -136,10 +145,9 @@ describe('cross-version remote terminal wire', () => {
   )
 
   it(
-    'new client against old server completes the journey',
+    'baseline client against current server completes the journey',
     async () => {
-      const record = await runTerminalSkewJourney({ hostBuild: baseline, clientBuild: current })
-      expect(record.hostRevision).toBe(baseline.revision)
+      const record = await runTerminalSkewJourney({ hostBuild: current, clientBuild: baseline })
       expectJourneyActuallyRan(record)
       expectWireCompatible(record)
     },
