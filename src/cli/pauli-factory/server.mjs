@@ -30,7 +30,9 @@ function redact(value) {
 
 function bounded(value) {
   const text = redact(value)
-  if (Buffer.byteLength(text) <= MAX_OUTPUT_BYTES) return text
+  if (Buffer.byteLength(text) <= MAX_OUTPUT_BYTES) {
+    return text
+  }
   return `${text.slice(0, MAX_OUTPUT_BYTES)}\n[OUTPUT_TRUNCATED]`
 }
 
@@ -43,9 +45,13 @@ function json(res, status, body) {
 }
 
 function authorized(req) {
-  if (!TOKEN) return false
+  if (!TOKEN) {
+    return false
+  }
   const header = String(req.headers.authorization || '')
-  if (!header.startsWith('Bearer ')) return false
+  if (!header.startsWith('Bearer ')) {
+    return false
+  }
   const supplied = Buffer.from(header.slice(7).trim())
   const expected = Buffer.from(TOKEN)
   return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected)
@@ -55,9 +61,13 @@ async function readJson(req) {
   let raw = ''
   for await (const chunk of req) {
     raw += chunk.toString()
-    if (raw.length > 1_000_000) throw new Error('Request body too large')
+    if (raw.length > 1_000_000) {
+      throw new Error('Request body too large')
+    }
   }
-  if (!raw.trim()) return {}
+  if (!raw.trim()) {
+    return {}
+  }
   return JSON.parse(raw)
 }
 
@@ -75,7 +85,9 @@ function assertWithinSandbox(candidate) {
 
 function parseJson(stdout) {
   const text = String(stdout || '').trim()
-  if (!text) return undefined
+  if (!text) {
+    return undefined
+  }
   try {
     return JSON.parse(text)
   } catch {
@@ -89,7 +101,7 @@ async function run(command, args, options = {}) {
   const result = await new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: { ...process.env, ...(options.env || {}) },
+      env: { ...process.env, ...options.env },
       shell: false,
       windowsHide: true,
     })
@@ -98,7 +110,9 @@ async function run(command, args, options = {}) {
     let stderr = ''
     let settled = false
     const finish = (payload) => {
-      if (settled) return
+      if (settled) {
+        return
+      }
       settled = true
       resolve(payload)
     }
@@ -108,10 +122,14 @@ async function run(command, args, options = {}) {
     }, options.timeoutMs || COMMAND_TIMEOUT_MS)
 
     child.stdout?.on('data', (chunk) => {
-      if (Buffer.byteLength(stdout) < MAX_OUTPUT_BYTES) stdout += chunk.toString()
+      if (Buffer.byteLength(stdout) < MAX_OUTPUT_BYTES) {
+        stdout += chunk.toString()
+      }
     })
     child.stderr?.on('data', (chunk) => {
-      if (Buffer.byteLength(stderr) < MAX_OUTPUT_BYTES) stderr += chunk.toString()
+      if (Buffer.byteLength(stderr) < MAX_OUTPUT_BYTES) {
+        stderr += chunk.toString()
+      }
     })
     child.on('error', (error) => {
       clearTimeout(timer)
@@ -150,16 +168,32 @@ async function ensureRoot() {
 function validateJob(job) {
   const requiredStrings = ['requestId', 'projectId', 'repository', 'outcome', 'idempotencyKey']
   for (const key of requiredStrings) {
-    if (!job || typeof job[key] !== 'string' || !job[key].trim()) throw new Error(`${key} is required`)
+    if (!job || typeof job[key] !== 'string' || !job[key].trim()) {
+      throw new Error(`${key} is required`)
+    }
   }
-  if (!REPOSITORY_RE.test(job.repository)) throw new Error('repository must be owner/name')
-  if (!['green', 'yellow', 'red'].includes(job.risk)) throw new Error('risk must be green, yellow, or red')
-  if (job.risk === 'red') throw new Error('red-risk coding jobs require a higher-level human approval and are not prepared here')
-  if (!Array.isArray(job.constraints) || !Array.isArray(job.proof)) throw new Error('constraints and proof must be arrays')
+  if (!REPOSITORY_RE.test(job.repository)) {
+    throw new Error('repository must be owner/name')
+  }
+  if (!['green', 'yellow', 'red'].includes(job.risk)) {
+    throw new Error('risk must be green, yellow, or red')
+  }
+  if (job.risk === 'red') {
+    throw new Error('red-risk coding jobs require a higher-level human approval and are not prepared here')
+  }
+  if (!Array.isArray(job.constraints) || !Array.isArray(job.proof)) {
+    throw new Error('constraints and proof must be arrays')
+  }
   const budget = job.budget || {}
-  if (!Number.isFinite(budget.runtimeMinutes) || budget.runtimeMinutes <= 0) throw new Error('budget.runtimeMinutes must be positive')
-  if (!Number.isFinite(budget.maxWorkers) || budget.maxWorkers < 1 || budget.maxWorkers > 8) throw new Error('budget.maxWorkers must be between 1 and 8')
-  if (!Number.isFinite(budget.maxRetries) || budget.maxRetries < 0 || budget.maxRetries > 10) throw new Error('budget.maxRetries must be between 0 and 10')
+  if (!Number.isFinite(budget.runtimeMinutes) || budget.runtimeMinutes <= 0) {
+    throw new Error('budget.runtimeMinutes must be positive')
+  }
+  if (!Number.isFinite(budget.maxWorkers) || budget.maxWorkers < 1 || budget.maxWorkers > 8) {
+    throw new Error('budget.maxWorkers must be between 1 and 8')
+  }
+  if (!Number.isFinite(budget.maxRetries) || budget.maxRetries < 0 || budget.maxRetries > 10) {
+    throw new Error('budget.maxRetries must be between 0 and 10')
+  }
 }
 
 function jobRecordPath(idempotencyKey) {
@@ -175,7 +209,9 @@ async function readExisting(job) {
     }
     return parsed
   } catch (error) {
-    if (error?.code === 'ENOENT') return null
+    if (error?.code === 'ENOENT') {
+      return null
+    }
     throw error
   }
 }
@@ -197,7 +233,9 @@ async function probeCapabilities() {
     .filter((receipt) => receipt.exitCode !== 0)
     .map((receipt) => `${receipt.command.slice(0, 2).join(' ')} exited ${receipt.exitCode}`)
   const versionReceipt = await run(ORCA_BIN, ['--version'])
-  if (versionReceipt.exitCode === 0) receipts.unshift(versionReceipt)
+  if (versionReceipt.exitCode === 0) {
+    receipts.unshift(versionReceipt)
+  }
   return {
     ok: failures.length === 0,
     version: versionReceipt.exitCode === 0 ? versionReceipt.stdout.trim() : undefined,
@@ -210,7 +248,9 @@ async function prepareJob(job) {
   validateJob(job)
   await ensureRoot()
   const existing = await readExisting(job)
-  if (existing && ['ready', 'running', 'testing', 'reviewing', 'complete'].includes(existing.state)) return existing
+  if (existing && ['ready', 'running', 'testing', 'reviewing', 'complete'].includes(existing.state)) {
+    return existing
+  }
 
   const receipt = {
     requestId: job.requestId,
@@ -245,13 +285,25 @@ async function prepareJob(job) {
       await fs.access(path.join(repoDir, '.git'))
       const fetched = await run(GIT_BIN, ['fetch', '--prune', 'origin'], { cwd: repoDir })
       receipt.commandReceipts.push(fetched)
-      if (fetched.exitCode !== 0) throw new Error('git fetch failed')
+      if (fetched.exitCode !== 0) {
+        throw new Error('git fetch failed')
+      }
     } catch (error) {
-      if (error?.message === 'git fetch failed') throw error
+      if (error?.message === 'git fetch failed') {
+        throw error
+      }
       await fs.rm(repoDir, { recursive: true, force: true })
-      const cloned = await run(GIT_BIN, ['clone', '--filter=blob:none', '--no-tags', `https://github.com/${job.repository}.git`, repoDir])
+      const cloned = await run(GIT_BIN, [
+        'clone',
+        '--filter=blob:none',
+        '--no-tags',
+        `https://github.com/${job.repository}.git`,
+        repoDir,
+      ])
       receipt.commandReceipts.push(cloned)
-      if (cloned.exitCode !== 0) throw new Error('git clone failed')
+      if (cloned.exitCode !== 0) {
+        throw new Error('git clone failed')
+      }
     }
 
     const repoAdd = await run(ORCA_BIN, ['repo', 'add', '--path', repoDir, '--json'])
@@ -303,11 +355,17 @@ const server = http.createServer(async (req, res) => {
       tokenConfigured: Boolean(TOKEN),
     })
   }
-  if (!authorized(req)) return json(res, 401, { error: 'Unauthorized' })
+  if (!authorized(req)) {
+    return json(res, 401, { error: 'Unauthorized' })
+  }
 
   try {
-    if (req.method === 'GET' && url.pathname === '/v1/capabilities') return json(res, 200, await probeCapabilities())
-    if (req.method === 'POST' && url.pathname === '/v1/jobs/prepare') return json(res, 200, await prepareJob(await readJson(req)))
+    if (req.method === 'GET' && url.pathname === '/v1/capabilities') {
+      return json(res, 200, await probeCapabilities())
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/jobs/prepare') {
+      return json(res, 200, await prepareJob(await readJson(req)))
+    }
     return json(res, 404, { error: 'NotFound' })
   } catch (error) {
     return json(res, 400, { error: error instanceof Error ? error.message : 'BadRequest' })
