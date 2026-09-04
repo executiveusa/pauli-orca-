@@ -23,6 +23,8 @@ Orca already owns project/worktree/terminal/orchestration behavior. This gateway
 
 ## Environment
 
+Same-host operation is the default and safest mode:
+
 ```bash
 export PAULI_FACTORY_TOKEN='use-a-secret-broker-value'
 export PAULI_SANDBOX_ROOT="$HOME/.orca/pauli-sandboxes"
@@ -40,7 +42,16 @@ export ORCA_FACTORY_BASE_URL='http://127.0.0.1:4810'
 export PAULI_FACTORY_TOKEN='same-scoped-secret'
 ```
 
-If Terabithia and Orca run on separate hosts, use a private network address and firewall the gateway from the public Internet.
+### Separate-host operation
+
+The gateway rejects non-loopback binds by default. If Terabithia and Orca must run on separate hosts, first place both hosts on an authenticated encrypted overlay such as Tailscale or WireGuard, restrict the gateway firewall to that overlay, then explicitly attest that boundary:
+
+```bash
+export ORCA_FACTORY_HOST='<overlay-address>'
+export ORCA_FACTORY_ENCRYPTED_OVERLAY='1'
+```
+
+Do not set `ORCA_FACTORY_ENCRYPTED_OVERLAY=1` for a public, ordinary LAN, or otherwise unencrypted listener. If the gateway is exposed through a reverse proxy instead of an encrypted overlay, terminate TLS with certificate validation at that boundary and keep the gateway listener itself on loopback.
 
 ## Start
 
@@ -97,13 +108,16 @@ curl -X POST \
 
 `state: "ready"` means only that repo/worktree preparation succeeded. It does not mean code was changed, tests passed, a PR exists, a preview exists or anything shipped.
 
-## Failure behavior
+## Concurrency and failure behavior
 
 - Missing/wrong token -> `401`.
 - Red-risk job -> rejected before sandbox mutation.
+- Non-loopback bind without encrypted-overlay attestation -> process refuses to start.
 - Orca unavailable -> capability `ok: false`; prepare returns blocked/failed evidence.
 - Git/Orca command failure -> no synthetic success.
-- Same idempotency key -> existing receipt reused when safe.
+- Same idempotency key -> preparation is serialized and a safe existing receipt is reused.
+- Timed-out subprocess -> SIGTERM, bounded grace period, then SIGKILL with exit code `124` if needed.
+- Receipt writes use unique temporary files and atomic rename.
 
 ## Rollback
 
