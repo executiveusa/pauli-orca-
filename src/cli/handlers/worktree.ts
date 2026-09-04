@@ -232,6 +232,7 @@ export const WORKTREE_HANDLERS: Record<string, CommandHandler> = {
     const result = await client.call<RuntimeWorktreeCreateResult>('worktree.create', {
       repo: await getCreateRepoSelector(flags, cwdParentWorktree, client),
       name: getRequiredStringFlag(flags, 'name'),
+      branchNameOverride: getOptionalStringFlag(flags, 'branch-name'),
       baseBranch: getOptionalStringFlag(flags, 'base-branch'),
       linkedIssue: getOptionalNumberFlag(flags, 'issue'),
       ...linearIssueLink,

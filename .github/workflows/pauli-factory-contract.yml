@@ -1,0 +1,121 @@
+name: Pauli Factory Contract
+
+on:
+  pull_request:
+    paths:
+      - 'src/cli/pauli-factory/**'
+      - 'docs/reference/pauli-factory-gateway.md'
+      - '.github/workflows/pauli-factory-contract.yml'
+  push:
+    branches:
+      - 'pauli/factory-gateway'
+    paths:
+      - 'src/cli/pauli-factory/**'
+      - 'docs/reference/pauli-factory-gateway.md'
+      - '.github/workflows/pauli-factory-contract.yml'
+
+permissions:
+  contents: read
+
+env:
+  FACTORY_TEST_TOKEN: ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Syntax check
+        run: node --check src/cli/pauli-factory/server.mjs
+
+      - name: Reject non-loopback HTTP without encrypted-overlay attestation
+        env:
+          PAULI_FACTORY_TOKEN: ${{ env.FACTORY_TEST_TOKEN }}
+          PAULI_SANDBOX_ROOT: ${{ runner.temp }}/transport-boundary
+          ORCA_FACTORY_HOST: 0.0.0.0
+          ORCA_FACTORY_PORT: '4811'
+        run: |
+          if node src/cli/pauli-factory/server.mjs >/tmp/nonloopback.log 2>&1; then
+            echo 'gateway unexpectedly accepted non-loopback plain HTTP' >&2
+            exit 1
+          fi
+          grep -q 'authenticated encrypted overlay' /tmp/nonloopback.log
+
+      - name: Start fail-closed test gateway
+        env:
+          PAULI_FACTORY_TOKEN: ${{ env.FACTORY_TEST_TOKEN }}
+          PAULI_SANDBOX_ROOT: ${{ runner.temp }}/pauli-sandboxes
+          ORCA_FACTORY_HOST: 127.0.0.1
+          ORCA_FACTORY_PORT: '4810'
+          ORCA_BIN: /bin/false
+          GIT_BIN: /usr/bin/git
+        run: |
+          node src/cli/pauli-factory/server.mjs > /tmp/pauli-factory.log 2>&1 &
+          echo $! > /tmp/pauli-factory.pid
+          for i in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:4810/health >/tmp/health.json; then break; fi
+            sleep 0.25
+          done
+          cat /tmp/health.json
+
+      - name: Verify public health is presence, not capability proof
+        run: |
+          node - <<'NODE'
+          const fs = require('fs')
+          const body = JSON.parse(fs.readFileSync('/tmp/health.json', 'utf8'))
+          if (body.status !== 'ok') throw new Error('health must report gateway process presence')
+          if (body.service !== 'pauli-orca-factory') throw new Error('wrong service identity')
+          if (body.tokenConfigured !== true) throw new Error('test token should be configured')
+          if (body.transport !== 'loopback-http') throw new Error('test gateway must be loopback-only')
+          NODE
+
+      - name: Verify protected route rejects missing token
+        run: |
+          code=$(curl --silent --output /tmp/unauth.json --write-out '%{http_code}' http://127.0.0.1:4810/v1/capabilities)
+          test "$code" = "401"
+
+      - name: Verify capabilities fail truthfully when Orca is unavailable
+        run: |
+          curl --fail --silent \
+            -H "Authorization: Bearer $FACTORY_TEST_TOKEN" \
+            http://127.0.0.1:4810/v1/capabilities > /tmp/capabilities.json
+          node - <<'NODE'
+          const fs = require('fs')
+          const body = JSON.parse(fs.readFileSync('/tmp/capabilities.json', 'utf8'))
+          if (body.ok !== false) throw new Error('capabilities must not claim ready when Orca fails')
+          if (!Array.isArray(body.failures) || body.failures.length === 0) throw new Error('failure evidence required')
+          if (!Array.isArray(body.receipts) || body.receipts.length < 3) throw new Error('command receipts required')
+          const validReceipt = (receipt) => Array.isArray(receipt.command) && Number.isInteger(receipt.exitCode)
+          if (!body.receipts.every(validReceipt)) throw new Error('every receipt must identify a command and exit code')
+          const git = body.receipts.find((receipt) => receipt.command[1] === '--version' && receipt.command[0].includes('git'))
+          if (!git || git.exitCode !== 0) throw new Error('successful Git version receipt required')
+          const agentContext = body.receipts.find((receipt) => receipt.command[1] === 'agent-context')
+          const status = body.receipts.find((receipt) => receipt.command[1] === 'status')
+          if (!agentContext || agentContext.exitCode === 0) throw new Error('failed Orca agent-context receipt required for this fixture')
+          if (!status || status.exitCode === 0) throw new Error('failed Orca status receipt required for this fixture')
+          NODE
+
+      - name: Verify red-risk jobs are blocked before sandbox mutation
+        run: |
+          sandbox_root="$RUNNER_TEMP/pauli-sandboxes"
+          before=$(find "$sandbox_root" -mindepth 1 -printf '%P\n' | sort)
+          code=$(curl --silent --output /tmp/red.json --write-out '%{http_code}' \
+            -H "Authorization: Bearer $FACTORY_TEST_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"requestId":"ci","projectId":"ci","repository":"executiveusa/pauli-orca-","outcome":"test","constraints":[],"proof":[],"risk":"red","budget":{"runtimeMinutes":5,"maxWorkers":1,"maxRetries":0},"idempotencyKey":"ci-red"}' \
+            http://127.0.0.1:4810/v1/jobs/prepare)
+          test "$code" = "400"
+          grep -q 'red-risk' /tmp/red.json
+          after=$(find "$sandbox_root" -mindepth 1 -printf '%P\n' | sort)
+          test "$after" = "$before"
+
+      - name: Stop gateway
+        if: always()
+        run: |
+          if test -f /tmp/pauli-factory.pid; then kill "$(cat /tmp/pauli-factory.pid)" 2>/dev/null || true; fi
+          cat /tmp/pauli-factory.log || true
