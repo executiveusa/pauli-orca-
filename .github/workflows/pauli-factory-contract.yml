@@ -3,13 +3,15 @@ name: Pauli Factory Contract
 on:
   pull_request:
     paths:
-      - 'pauli-factory/**'
+      - 'src/cli/pauli-factory/**'
+      - 'docs/reference/pauli-factory-gateway.md'
       - '.github/workflows/pauli-factory-contract.yml'
   push:
     branches:
       - 'pauli/factory-gateway'
     paths:
-      - 'pauli-factory/**'
+      - 'src/cli/pauli-factory/**'
+      - 'docs/reference/pauli-factory-gateway.md'
       - '.github/workflows/pauli-factory-contract.yml'
 
 permissions:
@@ -23,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Syntax check
-        run: node --check pauli-factory/server.mjs
+        run: node --check src/cli/pauli-factory/server.mjs
 
       - name: Start fail-closed test gateway
         env:
@@ -34,7 +36,7 @@ jobs:
           ORCA_BIN: /bin/false
           GIT_BIN: /usr/bin/git
         run: |
-          node pauli-factory/server.mjs > /tmp/pauli-factory.log 2>&1 &
+          node src/cli/pauli-factory/server.mjs > /tmp/pauli-factory.log 2>&1 &
           echo $! > /tmp/pauli-factory.pid
           for i in {1..20}; do
             if curl --fail --silent http://127.0.0.1:4810/health >/tmp/health.json; then break; fi
