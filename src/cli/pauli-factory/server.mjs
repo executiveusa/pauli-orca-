@@ -14,9 +14,14 @@ const DEFAULT_SANDBOX_ROOT = path.join(os.homedir(), '.orca', 'pauli-sandboxes')
 const SANDBOX_ROOT = path.resolve(process.env.PAULI_SANDBOX_ROOT || DEFAULT_SANDBOX_ROOT)
 const MAX_OUTPUT_BYTES = Number(process.env.ORCA_FACTORY_MAX_OUTPUT_BYTES || 65536)
 const COMMAND_TIMEOUT_MS = Number(process.env.ORCA_FACTORY_COMMAND_TIMEOUT_MS || 120000)
+const COMMAND_KILL_GRACE_MS = Number(process.env.ORCA_FACTORY_KILL_GRACE_MS || 5000)
+const LOCK_TIMEOUT_MS = Number(process.env.ORCA_FACTORY_LOCK_TIMEOUT_MS || 30000)
+const LOCK_STALE_MS = Number(process.env.ORCA_FACTORY_LOCK_STALE_MS || 300000)
+const ENCRYPTED_OVERLAY = process.env.ORCA_FACTORY_ENCRYPTED_OVERLAY === '1'
 
 const REPOSITORY_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const SAFE_SEGMENT_RE = /[^A-Za-z0-9_.-]+/g
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost'])
 
 function now() {
   return new Date().toISOString()
@@ -57,14 +62,26 @@ function authorized(req) {
   return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected)
 }
 
+function assertTransportBoundary() {
+  if (!LOOPBACK_HOSTS.has(HOST) && !ENCRYPTED_OVERLAY) {
+    throw new Error(
+      'Non-loopback factory binding requires ORCA_FACTORY_ENCRYPTED_OVERLAY=1 on an authenticated encrypted overlay',
+    )
+  }
+}
+
 async function readJson(req) {
-  let raw = ''
+  const chunks = []
+  let totalBytes = 0
   for await (const chunk of req) {
-    raw += chunk.toString()
-    if (raw.length > 1_000_000) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    totalBytes += buffer.length
+    if (totalBytes > 1_000_000) {
       throw new Error('Request body too large')
     }
+    chunks.push(buffer)
   }
+  const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw.trim()) {
     return {}
   }
@@ -95,6 +112,10 @@ function parseJson(stdout) {
   }
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 async function run(command, args, options = {}) {
   const startedAt = now()
   const started = Date.now()
@@ -109,16 +130,29 @@ async function run(command, args, options = {}) {
     let stdout = ''
     let stderr = ''
     let settled = false
+    let timedOut = false
+    let killTimer
+    let timeoutTimer
+
     const finish = (payload) => {
       if (settled) {
         return
       }
       settled = true
+      clearTimeout(timeoutTimer)
+      clearTimeout(killTimer)
       resolve(payload)
     }
-    const timer = setTimeout(() => {
+
+    timeoutTimer = setTimeout(() => {
+      timedOut = true
       child.kill('SIGTERM')
-      finish({ exitCode: 124, stdout, stderr: `${stderr}\ncommand timed out` })
+      killTimer = setTimeout(() => {
+        if (!settled) {
+          child.kill('SIGKILL')
+          finish({ exitCode: 124, stdout, stderr: `${stderr}\ncommand timed out` })
+        }
+      }, COMMAND_KILL_GRACE_MS)
     }, options.timeoutMs || COMMAND_TIMEOUT_MS)
 
     child.stdout?.on('data', (chunk) => {
@@ -132,11 +166,21 @@ async function run(command, args, options = {}) {
       }
     })
     child.on('error', (error) => {
-      clearTimeout(timer)
-      finish({ exitCode: 127, stdout, stderr: `${stderr}\n${error.message}` })
+      finish({
+        exitCode: timedOut ? 124 : 127,
+        stdout,
+        stderr: timedOut ? `${stderr}\ncommand timed out` : `${stderr}\n${error.message}`,
+      })
     })
     child.on('close', (code, signal) => {
-      clearTimeout(timer)
+      if (timedOut) {
+        finish({
+          exitCode: 124,
+          stdout,
+          stderr: signal ? `${stderr}\ncommand timed out; terminated by ${signal}` : `${stderr}\ncommand timed out`,
+        })
+        return
+      }
       finish({
         exitCode: typeof code === 'number' ? code : 128,
         stdout,
@@ -163,6 +207,7 @@ async function run(command, args, options = {}) {
 async function ensureRoot() {
   await fs.mkdir(path.join(SANDBOX_ROOT, 'repos'), { recursive: true })
   await fs.mkdir(path.join(SANDBOX_ROOT, 'jobs'), { recursive: true })
+  await fs.mkdir(path.join(SANDBOX_ROOT, 'locks'), { recursive: true })
 }
 
 function validateJob(job) {
@@ -196,9 +241,47 @@ function validateJob(job) {
   }
 }
 
+function jobDigest(idempotencyKey) {
+  return crypto.createHash('sha256').update(idempotencyKey).digest('hex')
+}
+
 function jobRecordPath(idempotencyKey) {
-  const digest = crypto.createHash('sha256').update(idempotencyKey).digest('hex')
-  return path.join(SANDBOX_ROOT, 'jobs', `${digest}.json`)
+  return path.join(SANDBOX_ROOT, 'jobs', `${jobDigest(idempotencyKey)}.json`)
+}
+
+function jobLockPath(idempotencyKey) {
+  return path.join(SANDBOX_ROOT, 'locks', `${jobDigest(idempotencyKey)}.lock`)
+}
+
+async function acquireJobLock(idempotencyKey) {
+  const lockPath = jobLockPath(idempotencyKey)
+  const deadline = Date.now() + LOCK_TIMEOUT_MS
+  while (true) {
+    try {
+      await fs.mkdir(lockPath)
+      return async () => fs.rm(lockPath, { recursive: true, force: true })
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        throw error
+      }
+      try {
+        const stat = await fs.stat(lockPath)
+        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          await fs.rm(lockPath, { recursive: true, force: true })
+          continue
+        }
+      } catch (statError) {
+        if (statError?.code === 'ENOENT') {
+          continue
+        }
+        throw statError
+      }
+      if (Date.now() >= deadline) {
+        throw new Error('Timed out waiting for idempotency lock')
+      }
+      await delay(100)
+    }
+  }
 }
 
 async function readExisting(job) {
@@ -218,7 +301,7 @@ async function readExisting(job) {
 
 async function persistReceipt(job, receipt) {
   const file = jobRecordPath(job.idempotencyKey)
-  const temp = `${file}.${process.pid}.tmp`
+  const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
   await fs.writeFile(temp, JSON.stringify(receipt, null, 2), { mode: 0o600 })
   await fs.rename(temp, file)
 }
@@ -244,9 +327,7 @@ async function probeCapabilities() {
   }
 }
 
-async function prepareJob(job) {
-  validateJob(job)
-  await ensureRoot()
+async function prepareJobLocked(job) {
   const existing = await readExisting(job)
   if (existing && ['ready', 'running', 'testing', 'reviewing', 'complete'].includes(existing.state)) {
     return existing
@@ -344,6 +425,19 @@ async function prepareJob(job) {
   }
 }
 
+async function prepareJob(job) {
+  validateJob(job)
+  await ensureRoot()
+  const releaseLock = await acquireJobLock(job.idempotencyKey)
+  try {
+    return await prepareJobLocked(job)
+  } finally {
+    await releaseLock()
+  }
+}
+
+assertTransportBoundary()
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
   if (req.method === 'GET' && url.pathname === '/health') {
@@ -353,6 +447,7 @@ const server = http.createServer(async (req, res) => {
       adapterVersion: 'terabithia-orca-v1',
       sandboxRoot: SANDBOX_ROOT,
       tokenConfigured: Boolean(TOKEN),
+      transport: LOOPBACK_HOSTS.has(HOST) ? 'loopback-http' : 'encrypted-overlay-http',
     })
   }
   if (!authorized(req)) {
